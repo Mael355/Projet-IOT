@@ -1,7 +1,8 @@
-// Radio-Secours etapes 1 a 4 WiFi LCD chat LED buzzer
+// Radio-Secours version complete
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <rgb_lcd.h>
 
 // broches
@@ -10,10 +11,17 @@ const int LED_JAUNE = 26;
 const int LED_ROUGE = 27;
 const int LED_BLEUE = 32;
 const int BUZZER = 18;
+const int BOUTON = 4;
+const int POT = 34;
 
 const int MAX_MSG = 25;
 
+// reseau WiFi protege
+const char* NOM_WIFI = "Radio-Secours";
+const char* MOT_DE_PASSE = "Kx7!Pm4q-Zr9w#";
+
 WebServer serveur(80);
+DNSServer dns;
 rgb_lcd lcd;
 
 // historique en RAM
@@ -26,7 +34,9 @@ Message historique[MAX_MSG];
 int nbMsg = 0;
 int dernierId = 0;
 
+bool silencieux = false;
 const int LUM = 180;
+int volume = 50;
 unsigned long octets = 0;
 unsigned long debit = 0;
 unsigned long debutBleue = 0;
@@ -63,14 +73,14 @@ button{font:inherit;font-weight:bold;padding:0 18px;border:0;border-radius:10px;
 </form>
 <script>
 const $=id=>document.getElementById(id);
-let dernier=0,init=false,audio=null;
+let dernier=0,init=false,audio=null,vol=50;
 $('pseudo').value=localStorage.pseudo||'';
 $('pseudo').readOnly=!!localStorage.pseudo;
 document.onpointerdown=()=>{audio=audio||new AudioContext();audio.resume()};
 function son(){
- if(!audio)return;
+ if(!audio||vol==0)return;
  const o=audio.createOscillator(),g=audio.createGain();
- g.gain.value=0.1;o.frequency.value=880;
+ g.gain.value=0.2*vol/100;o.frequency.value=880;
  o.connect(g).connect(audio.destination);
  o.start();o.stop(audio.currentTime+0.12);
 }
@@ -89,9 +99,10 @@ async function actualiser(){
   const d=await(await fetch('/msg?depuis='+dernier)).json();
   let nouveau=false;
   for(const m of d.msg)if(m.id>dernier){ajouter(m);dernier=m.id;nouveau=true}
-  if(init&&nouveau)son();
+  vol=d.vol;
+  if(init&&nouveau&&!d.muet)son();
   init=true;
-  $('etat').textContent=d.app+' connecté(s) · '+d.debit+' o/s';
+  $('etat').textContent=d.app+' connecté(s) · '+d.debit+' o/s · '+(d.muet?'🔇 silence':'🔊 '+d.vol+' %');
  }catch(e){$('etat').textContent='Connexion perdue'}
 }
 $('form').onsubmit=async e=>{
@@ -115,9 +126,11 @@ String echapper(String s) {
   return s;
 }
 
-// bip court du buzzer
+// bip court au volume du potentiometre
 void bip() {
+  if (silencieux || volume == 0) return;
   ledcWriteTone(BUZZER, 1000);
+  ledcWrite(BUZZER, volume * 512 / 100);
   finBip = millis() + 120;
 }
 
@@ -146,6 +159,8 @@ void envoyerMessages() {
   int depuis = serveur.arg("depuis").toInt();
   String json = "{\"app\":" + String(WiFi.softAPgetStationNum());
   json += ",\"debit\":" + String(debit);
+  json += ",\"muet\":" + String(silencieux ? "true" : "false");
+  json += ",\"vol\":" + String(volume);
   json += ",\"msg\":[";
   for (int i = 0; i < nbMsg; i++) {
     if (historique[i].id <= depuis) continue;
@@ -174,9 +189,50 @@ void recevoirMessage() {
   serveur.send(200, "text/plain", "ok");
 }
 
+// portail captif toute adresse inconnue renvoie vers le chat
+void redirigerPortail() {
+  serveur.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
+  serveur.send(302, "text/plain", "");
+}
+
+// bouton mute avec anti rebond
+void lireBouton() {
+  static int avant = HIGH;
+  static unsigned long dernierAppui = 0;
+  int etat = digitalRead(BOUTON);
+  if (etat == LOW && avant == HIGH && millis() - dernierAppui > 200) {
+    silencieux = !silencieux;
+    dernierAppui = millis();
+    Serial.println(silencieux ? "Mode silencieux" : "Son actif");
+  }
+  avant = etat;
+}
+
+// LCD alterne adresse et mot de passe toutes les 3 s
+void mettreAJourLCD() {
+  static unsigned long dernierChangement = 0;
+  static bool pageAdresse = true;
+  if (millis() - dernierChangement < 3000) return;
+  dernierChangement = millis();
+  pageAdresse = !pageAdresse;
+  lcd.clear();
+  if (pageAdresse) {
+    lcd.print("Radio-Secours");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.softAPIP());
+  } else {
+    lcd.print("Mot de passe :");
+    lcd.setCursor(0, 1);
+    lcd.print(MOT_DE_PASSE);
+  }
+}
+
 // LED et buzzer sans delay
 void mettreAJourSorties() {
   unsigned long maintenant = millis();
+
+  // volume du son par le potentiometre
+  volume = analogRead(POT) * 100 / 4095;
 
   // debit mesure chaque seconde
   static unsigned long debutFenetre = 0;
@@ -205,8 +261,8 @@ void mettreAJourSorties() {
     }
   }
 
-  // fin du bip
-  if (finBip && maintenant >= finBip) {
+  // fin du bip ou mute pendant le bip
+  if (finBip && (maintenant >= finBip || silencieux || volume == 0)) {
     ledcWriteTone(BUZZER, 0);
     finBip = 0;
   }
@@ -214,14 +270,18 @@ void mettreAJourSorties() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BOUTON, INPUT_PULLUP);
   ledcAttach(LED_VERTE, 5000, 8);
   ledcAttach(LED_JAUNE, 5000, 8);
   ledcAttach(LED_ROUGE, 5000, 8);
   ledcAttach(LED_BLEUE, 5000, 8);
   ledcAttach(BUZZER, 1000, 10);
 
-  // reseau WiFi ouvert sans Internet
-  WiFi.softAP("Radio-Secours");
+  // reseau WiFi protege sans Internet
+  WiFi.softAP(NOM_WIFI, MOT_DE_PASSE);
+
+  // tous les noms de domaine pointent vers l ESP32
+  dns.start(53, "*", WiFi.softAPIP());
 
   // adresse du site sur le LCD Grove
   lcd.begin(16, 2);
@@ -234,13 +294,19 @@ void setup() {
   serveur.on("/", envoyerPage);
   serveur.on("/msg", envoyerMessages);
   serveur.on("/envoyer", HTTP_POST, recevoirMessage);
+  serveur.onNotFound(redirigerPortail);
   serveur.begin();
 
   Serial.print("Site : http://");
   Serial.println(WiFi.softAPIP());
+  Serial.print("Mot de passe WiFi : ");
+  Serial.println(MOT_DE_PASSE);
 }
 
 void loop() {
+  dns.processNextRequest();
   serveur.handleClient();
+  lireBouton();
   mettreAJourSorties();
+  mettreAJourLCD();
 }
