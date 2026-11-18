@@ -1,16 +1,20 @@
-// Radio-Secours etapes 1 et 2 reseau WiFi LCD serveur web et chat
+// Radio-Secours etapes 1 a 4 WiFi LCD chat LED buzzer
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <LiquidCrystal_I2C.h>
+#include <rgb_lcd.h>
 
 // broches
 const int LED_VERTE = 25;
+const int LED_JAUNE = 26;
+const int LED_ROUGE = 27;
+const int LED_BLEUE = 32;
+const int BUZZER = 18;
 
 const int MAX_MSG = 25;
 
 WebServer serveur(80);
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+rgb_lcd lcd;
 
 // historique en RAM
 struct Message {
@@ -21,6 +25,12 @@ struct Message {
 Message historique[MAX_MSG];
 int nbMsg = 0;
 int dernierId = 0;
+
+const int LUM = 180;
+unsigned long octets = 0;
+unsigned long debit = 0;
+unsigned long debutBleue = 0;
+unsigned long finBip = 0;
 
 // page web mobile
 const char PAGE[] = R"HTML(<!doctype html>
@@ -40,6 +50,7 @@ h1{margin:0;font-size:18px}
 form{display:flex;flex-wrap:wrap;gap:8px;padding:8px;background:#1e293b}
 input{font:inherit;padding:12px;border:0;border-radius:10px;background:#334155;color:#fff}
 #pseudo{width:100%}
+#pseudo:read-only{opacity:.6}
 #texte{flex:1;min-width:0}
 button{font:inherit;font-weight:bold;padding:0 18px;border:0;border-radius:10px;background:#22c55e;color:#052e16}
 </style></head><body>
@@ -52,8 +63,17 @@ button{font:inherit;font-weight:bold;padding:0 18px;border:0;border-radius:10px;
 </form>
 <script>
 const $=id=>document.getElementById(id);
-let dernier=0;
+let dernier=0,init=false,audio=null;
 $('pseudo').value=localStorage.pseudo||'';
+$('pseudo').readOnly=!!localStorage.pseudo;
+document.onpointerdown=()=>{audio=audio||new AudioContext();audio.resume()};
+function son(){
+ if(!audio)return;
+ const o=audio.createOscillator(),g=audio.createGain();
+ g.gain.value=0.1;o.frequency.value=880;
+ o.connect(g).connect(audio.destination);
+ o.start();o.stop(audio.currentTime+0.12);
+}
 function ajouter(m){
  const d=document.createElement('div');
  d.className='msg'+(m.p==$('pseudo').value?' moi':'');
@@ -67,13 +87,17 @@ function ajouter(m){
 async function actualiser(){
  try{
   const d=await(await fetch('/msg?depuis='+dernier)).json();
-  for(const m of d.msg)if(m.id>dernier){ajouter(m);dernier=m.id}
-  $('etat').textContent='En ligne';
+  let nouveau=false;
+  for(const m of d.msg)if(m.id>dernier){ajouter(m);dernier=m.id;nouveau=true}
+  if(init&&nouveau)son();
+  init=true;
+  $('etat').textContent=d.app+' connecté(s) · '+d.debit+' o/s';
  }catch(e){$('etat').textContent='Connexion perdue'}
 }
 $('form').onsubmit=async e=>{
  e.preventDefault();
  localStorage.pseudo=$('pseudo').value;
+ $('pseudo').readOnly=true;
  await fetch('/envoyer',{method:'POST',body:new URLSearchParams({p:$('pseudo').value,t:$('texte').value})});
  $('texte').value='';
  actualiser();
@@ -91,6 +115,12 @@ String echapper(String s) {
   return s;
 }
 
+// bip court du buzzer
+void bip() {
+  ledcWriteTone(BUZZER, 1000);
+  finBip = millis() + 120;
+}
+
 void ajouterMessage(String pseudo, String texte) {
   // historique plein on decale
   if (nbMsg == MAX_MSG) {
@@ -100,18 +130,23 @@ void ajouterMessage(String pseudo, String texte) {
   dernierId++;
   historique[nbMsg] = {dernierId, pseudo, texte};
   nbMsg++;
+  bip();
+  debutBleue = millis();
   Serial.println(pseudo + " : " + texte);
 }
 
 // GET /
 void envoyerPage() {
   serveur.send(200, "text/html", PAGE);
+  octets += strlen(PAGE);
 }
 
 // GET /msg?depuis=id
 void envoyerMessages() {
   int depuis = serveur.arg("depuis").toInt();
-  String json = "{\"msg\":[";
+  String json = "{\"app\":" + String(WiFi.softAPgetStationNum());
+  json += ",\"debit\":" + String(debit);
+  json += ",\"msg\":[";
   for (int i = 0; i < nbMsg; i++) {
     if (historique[i].id <= depuis) continue;
     if (!json.endsWith("[")) json += ",";
@@ -121,6 +156,7 @@ void envoyerMessages() {
   }
   json += "]}";
   serveur.send(200, "application/json", json);
+  octets += json.length();
 }
 
 // POST /envoyer
@@ -133,20 +169,63 @@ void recevoirMessage() {
     serveur.send(400, "text/plain", "vide");
     return;
   }
+  octets += pseudo.length() + texte.length();
   ajouterMessage(pseudo.substring(0, 24), texte.substring(0, 200));
   serveur.send(200, "text/plain", "ok");
 }
 
+// LED et buzzer sans delay
+void mettreAJourSorties() {
+  unsigned long maintenant = millis();
+
+  // debit mesure chaque seconde
+  static unsigned long debutFenetre = 0;
+  if (maintenant - debutFenetre >= 1000) {
+    debit = octets;
+    octets = 0;
+    debutFenetre = maintenant;
+  }
+
+  // rouge clignote plus vite quand le debit monte
+  unsigned long periode = constrain(500 - (long)debit / 5, 50L, 500L);
+  bool rougeAllumee = debit > 0 && (maintenant / periode) % 2;
+
+  ledcWrite(LED_VERTE, LUM);
+  ledcWrite(LED_JAUNE, WiFi.softAPgetStationNum() > 0 ? LUM : 0);
+  ledcWrite(LED_ROUGE, rougeAllumee ? LUM : 0);
+
+  // fondu LED bleue 300 ms montee 700 ms descente
+  if (debutBleue) {
+    unsigned long t = maintenant - debutBleue;
+    if (t < 300) ledcWrite(LED_BLEUE, t * LUM / 300);
+    else if (t < 1000) ledcWrite(LED_BLEUE, (1000 - t) * LUM / 700);
+    else {
+      ledcWrite(LED_BLEUE, 0);
+      debutBleue = 0;
+    }
+  }
+
+  // fin du bip
+  if (finBip && maintenant >= finBip) {
+    ledcWriteTone(BUZZER, 0);
+    finBip = 0;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_VERTE, OUTPUT);
+  ledcAttach(LED_VERTE, 5000, 8);
+  ledcAttach(LED_JAUNE, 5000, 8);
+  ledcAttach(LED_ROUGE, 5000, 8);
+  ledcAttach(LED_BLEUE, 5000, 8);
+  ledcAttach(BUZZER, 1000, 10);
 
   // reseau WiFi ouvert sans Internet
   WiFi.softAP("Radio-Secours");
 
-  // adresse du site sur le LCD
-  lcd.init();
-  lcd.backlight();
+  // adresse du site sur le LCD Grove
+  lcd.begin(16, 2);
+  lcd.setRGB(0, 120, 255);
   lcd.print("Radio-Secours");
   lcd.setCursor(0, 1);
   lcd.print(WiFi.softAPIP());
@@ -157,11 +236,11 @@ void setup() {
   serveur.on("/envoyer", HTTP_POST, recevoirMessage);
   serveur.begin();
 
-  digitalWrite(LED_VERTE, HIGH);
   Serial.print("Site : http://");
   Serial.println(WiFi.softAPIP());
 }
 
 void loop() {
   serveur.handleClient();
+  mettreAJourSorties();
 }
