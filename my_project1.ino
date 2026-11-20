@@ -81,7 +81,8 @@ button{background:#22c55e}
   <div style="display:flex;gap:8px"><input id="pseudo" type="text" maxlength="24" placeholder="Ton pseudo"><button onclick="modifierPseudo()" style="background:#475569;color:#fff">Modifier</button></div>
   <input id="texte" type="text" maxlength="200" placeholder="Message" onkeydown="if(event.key==='Enter')envoyerTexte()">
   <button onclick="envoyerTexte()">Envoyer</button>
-  <label>🎙️ Vocal (256 Kio max, M4A ou MP3) : <input id="fichier" type="file" accept="audio/*" onchange="envoyerVocal()"></label>
+  <label>🎙️ Vocal (256 Kio max, M4A ou MP3) : <input id="fichier" type="file" accept="audio/*,.m4a,.mp3,.wav,.aac" onchange="envoyerVocal()"></label>
+  <small>iPhone : ouvre la page dans Safari. Enregistre d'abord dans Dictaphone, puis Partager → Enregistrer dans Fichiers, puis choisis le fichier ici.</small>
   <small id="info"></small>
 </div>
 <script>
@@ -89,6 +90,8 @@ const $ = id => document.getElementById(id);
 let dernier = 0;
 let premiereLecture = true;
 let audio = null;
+let lectureEnCours = false;
+let envoiEnCours = false;
 $('pseudo').value = localStorage.getItem('pseudo') || '';
 $('pseudo').readOnly = $('pseudo').value != '';
 
@@ -99,13 +102,20 @@ function modifierPseudo() {
 
 // le navigateur autorise le son seulement apres un appui
 document.addEventListener('pointerdown', () => {
-  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
-  audio.resume();
+  try {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (e) {}
+});
+
+// libere le son quand on quitte la page pour l'appli dictaphone
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && audio) audio.suspend();
 });
 
 // bip court dans le telephone
 function son(vol) {
-  if (!audio || vol == 0) return;
+  if (!audio || vol == 0 || document.hidden) return;
+  audio.resume();
   const o = audio.createOscillator();
   const g = audio.createGain();
   g.gain.value = 0.2 * vol / 100;
@@ -137,12 +147,19 @@ function afficher(m) {
 
 // recupere les nouveaux messages
 async function actualiser() {
+  // une seule lecture a la fois sinon les messages s'affichent en double
+  if (lectureEnCours) return;
+  lectureEnCours = true;
   try {
     const r = await fetch('/msg?depuis=' + dernier);
     const d = await r.json();
     // l'ESP32 a redemarre
     if (d.dernier < dernier) { dernier = 0; $('liste').innerHTML = ''; return; }
-    for (const m of d.msg) { afficher(m); dernier = m.id; }
+    for (const m of d.msg) {
+      if (m.id <= dernier) continue;
+      afficher(m);
+      dernier = m.id;
+    }
     // pas de bip pour l'historique au chargement
     if (!premiereLecture && d.msg.length > 0 && !d.muet) son(d.vol);
     premiereLecture = false;
@@ -152,6 +169,8 @@ async function actualiser() {
       : '📡 Relais INACTIF';
   } catch (e) {
     $('etat').textContent = 'Connexion perdue';
+  } finally {
+    lectureEnCours = false;
   }
 }
 
@@ -173,17 +192,25 @@ async function envoyerTexte() {
 }
 
 async function envoyerVocal() {
+  const f = $('fichier').files && $('fichier').files[0];
   const p = lirePseudo();
-  const f = $('fichier').files[0];
-  $('fichier').value = '';
-  if (!p || !f) return;
+  if (!p || !f || envoiEnCours) return;
   if (f.size > 256 * 1024) { $('info').textContent = 'Fichier trop gros (256 Kio max)'; return; }
+
+  envoiEnCours = true;
   $('info').textContent = 'Envoi du vocal...';
-  const form = new FormData();
-  form.append('p', p);
-  form.append('audio', f, f.name);
-  const r = await fetch('/envoyer-vocal', {method: 'POST', body: form});
-  $('info').textContent = r.ok ? 'Vocal envoyé' : 'Échec : ' + await r.text();
+  try {
+    const form = new FormData();
+    form.append('p', p);
+    form.append('audio', f, f.name || 'vocal.m4a');
+    const r = await fetch('/envoyer-vocal', {method: 'POST', body: form});
+    $('info').textContent = r.ok ? 'Vocal envoyé' : 'Échec : ' + await r.text();
+  } catch (e) {
+    $('info').textContent = 'Échec de l\'envoi du vocal';
+  }
+  // vide le champ apres l'envoi pour pouvoir reprendre le meme fichier
+  $('fichier').value = '';
+  envoiEnCours = false;
   actualiser();
 }
 
